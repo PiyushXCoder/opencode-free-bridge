@@ -1,0 +1,92 @@
+name: Docker image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/docker.yml
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  # metadata-action lowercases this; GHCR rejects upper-case repository names.
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=ref,event=pr
+
+      # Build amd64 into the local daemon first so it can be checked before
+      # anything is pushed. The free-tier gate inspects the TLS ClientHello,
+      # so an image whose Bun drifts from transport-baseline.json is useless.
+      - name: Build (amd64, local)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: bridge:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: TLS fingerprint inside the image
+        run: docker run --rm bridge:ci bun transport-fingerprint.js --check
+
+      - name: Container boots and serves /health
+        run: |
+          docker run -d --name bridge -e AUTO_UPDATE=0 -p 127.0.0.1:20129:20129 bridge:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:20129/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs bridge
+          exit 1
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64 + arm64)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
